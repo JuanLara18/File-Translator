@@ -8,7 +8,7 @@ import time
 
 # Page configuration
 st.set_page_config(
-    page_title="Excel Translator Pro",
+    page_title="Excel Translator",
     page_icon="🌐",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -117,14 +117,12 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-def create_metrics_card(title, value):
-    """Create a styled metric card"""
-    st.markdown(f"""
-        <div class="metrics-container">
-            <h4 style="color: #666; margin-bottom: 0.5rem; font-size: 0.9rem;">{title}</h4>
-            <h2 style="color: #1E88E5; margin: 0; font-size: 1.8rem;">{value}</h2>
-        </div>
-    """, unsafe_allow_html=True)
+def get_default_columns(available_columns):
+    """
+    Returns a list of default columns that exist in the uploaded file.
+    """
+    desired_columns = ['MeasureDescription', 'CauseDescription', 'TechnicalObjectDescription']
+    return [col for col in desired_columns if col in available_columns]
 
 def main():
     # Get API key from secrets
@@ -137,7 +135,7 @@ def main():
     
     # Sidebar
     with st.sidebar:
-        st.markdown("## Excel Translator Pro")
+        st.markdown("## Excel Translator")
         st.markdown("---")
         st.markdown("### About")
         st.info("""
@@ -172,80 +170,90 @@ def main():
         )
 
     if uploaded_file:
-        # Read Excel file
-        df = pd.read_excel(uploaded_file)
-        
-        # Display file statistics
-        with col2:
-            create_metrics_card("📊 Total Rows", f"{len(df):,}")
-            create_metrics_card("📑 Total Columns", len(df.columns))
+        try:
+            # Read Excel file
+            df = pd.read_excel(uploaded_file)
+            
+            # Display file statistics
+            with col2:
+                create_metrics_card("📊 Total Rows", f"{len(df):,}")
+                create_metrics_card("📑 Total Columns", len(df.columns))
 
-        # Column selection
-        st.markdown("### 🎯 Select Columns to Translate")
-        columns_to_translate = st.multiselect(
-            "Choose the columns containing German text:",
-            options=df.columns.tolist(),
-            default=['MeasureDescription', 'CauseDescription', 'TechnicalObjectDescription']
-        )
+            # Get available columns and default selection
+            available_columns = df.columns.tolist()
+            default_columns = get_default_columns(available_columns)
 
-        if columns_to_translate:
-            # Preview original data
-            if show_original:
-                st.markdown("### 📊 Original Data Preview")
-                st.dataframe(
-                    df[columns_to_translate].head(),
-                    use_container_width=True,
-                    height=200
-                )
+            # Column selection with dynamic defaults
+            st.markdown("### 🎯 Select Columns to Translate")
+            columns_to_translate = st.multiselect(
+                "Choose the columns containing German text:",
+                options=available_columns,
+                default=default_columns if default_columns else None,
+                help="Select the columns that contain German text you want to translate"
+            )
 
-            # Translation process
-            if st.button("🚀 Start Translation", use_container_width=True):
-                try:
-                    progress_placeholder = st.empty()
-                    
-                    with st.spinner("🔄 Translation in progress..."):
-                        start_time = time.time()
-                        translated_df = process_excel(
-                            df=df,
-                            translate_col=columns_to_translate,
-                            client=client,
-                            batch_size=batch_size,
-                            progress_callback=lambda x: progress_placeholder.progress(x)
-                        )
-                        end_time = time.time()
-
-                    st.success(f"""
-                        ✨ Translation completed successfully!
-                        ⏱️ Time taken: {end_time - start_time:.2f} seconds
-                        📊 Columns translated: {len(columns_to_translate)}
-                    """)
-
-                    # Preview translated data
-                    st.markdown("### 🎉 Translation Preview")
-                    preview_columns = []
-                    for col in columns_to_translate:
-                        preview_columns.extend([col, f"{col}_EN"])
+            if columns_to_translate:
+                # Preview original data
+                if show_original:
+                    st.markdown("### 📊 Original Data Preview")
                     st.dataframe(
-                        translated_df[preview_columns].head(),
+                        df[columns_to_translate].head(),
                         use_container_width=True,
-                        height=300
+                        height=200
                     )
 
-                    # Download section
-                    st.markdown("### 💾 Download Results")
-                    buffer = BytesIO()
-                    translated_df.to_excel(buffer, index=False)
-                    
-                    st.download_button(
-                        label="📥 Download Translated Excel",
-                        data=buffer.getvalue(),
-                        file_name="translated_document.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
+                # Translation process
+                if st.button("🚀 Start Translation", use_container_width=True):
+                    try:
+                        progress_placeholder = st.empty()
+                        
+                        with st.spinner("🔄 Translation in progress..."):
+                            start_time = time.time()
+                            translated_df = process_excel(
+                                df=df,
+                                translate_col=columns_to_translate,
+                                client=client,
+                                batch_size=batch_size,
+                                progress_callback=lambda x: progress_placeholder.progress(x)
+                            )
+                            end_time = time.time()
 
-                except Exception as e:
-                    st.error(f"❌ An error occurred: {str(e)}")
+                        st.success(f"""
+                            ✨ Translation completed successfully!
+                            ⏱️ Time taken: {end_time - start_time:.2f} seconds
+                            📊 Columns translated: {len(columns_to_translate)}
+                        """)
+
+                        # Preview translated data
+                        st.markdown("### 🎉 Translation Preview")
+                        preview_columns = []
+                        for col in columns_to_translate:
+                            preview_columns.extend([col, f"{col}_EN"])
+                        st.dataframe(
+                            translated_df[preview_columns].head(),
+                            use_container_width=True,
+                            height=300
+                        )
+
+                        # Download section
+                        st.markdown("### 💾 Download Results")
+                        buffer = BytesIO()
+                        translated_df.to_excel(buffer, index=False)
+                        
+                        st.download_button(
+                            label="📥 Download Translated Excel",
+                            data=buffer.getvalue(),
+                            file_name="translated_document.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+
+                    except Exception as e:
+                        st.error(f"❌ An error occurred during translation: {str(e)}")
+        
+        except Exception as e:
+            st.error(f"❌ Error reading Excel file: {str(e)}")
+            st.info("Please make sure your Excel file is not corrupted and try again.")
 
 if __name__ == "__main__":
     main()
