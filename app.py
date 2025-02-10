@@ -1,259 +1,208 @@
 import streamlit as st
-from excel_translation import translate_text, process_excel
 import pandas as pd
-from io import BytesIO
 import os
-from openai import OpenAI
-import time
+import tempfile
+from datetime import datetime
+from excel_translation import translate_text, create_translation_cache
+from io import BytesIO
 
 # Page configuration
 st.set_page_config(
     page_title="Excel Translator",
     page_icon="🌐",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS with enhanced aesthetics
+# Custom CSS
 st.markdown("""
     <style>
-        /* Global styles */
-        [data-testid="stAppViewContainer"] {
-            background: linear-gradient(to bottom right, #f8f9fa, #e9ecef);
-        }
-        
-        /* Main container */
-        .main {
-            padding: 2rem;
-            max-width: 1200px;
-            margin: 0 auto;
-        }
-        
-        /* Header and text styles */
-        .stTitle {
-            background: linear-gradient(120deg, #1E88E5, #1976D2);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            font-size: 3rem !important;
-            font-weight: 800 !important;
-            text-align: center;
-            margin-bottom: 2rem !important;
-        }
-        
-        /* Card containers */
-        .stCard {
-            background-color: white;
-            border-radius: 15px;
-            padding: 2rem;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            margin-bottom: 2rem;
-            transition: transform 0.3s ease;
-        }
-        
-        .stCard:hover {
-            transform: translateY(-5px);
-        }
-        
-        /* Buttons */
-        .stButton>button {
-            background: linear-gradient(90deg, #1E88E5, #1976D2);
-            color: white;
-            padding: 0.75rem 1.5rem;
-            border-radius: 10px;
-            border: none;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            width: 100%;
-        }
-        
-        .stButton>button:hover {
-            background: linear-gradient(90deg, #1976D2, #1565C0);
-            box-shadow: 0 4px 15px rgba(30, 136, 229, 0.3);
-        }
-        
-        /* Progress bar */
-        .stProgress > div > div {
-            background: linear-gradient(90deg, #1E88E5, #1976D2);
-        }
-        
-        /* File uploader */
-        [data-testid="stFileUploader"] {
-            border: 2px dashed #1E88E5;
-            border-radius: 10px;
-            padding: 2rem;
-            margin: 1rem 0;
-            background-color: rgba(30, 136, 229, 0.05);
-        }
-        
-        /* Metrics container */
-        .metrics-container {
-            background-color: white;
-            border-radius: 15px;
-            padding: 1.5rem;
-            margin: 1rem 0;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
-            border: 1px solid #e9ecef;
-        }
-        
-        /* Sidebar */
-        [data-testid="stSidebar"] {
-            background-color: white;
-            padding: 2rem 1rem;
-        }
-        
-        /* Expander */
-        .streamlit-expanderHeader {
-            background-color: white;
-            border-radius: 10px;
-        }
-        
-        /* DataFrames */
-        [data-testid="stDataFrame"] {
-            background-color: white;
-            border-radius: 10px;
-            padding: 1rem;
-            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
-        }
+    .main {
+        padding: 2rem;
+    }
+    .stButton>button {
+        width: 100%;
+        background-color: #4CAF50;
+        color: white;
+        padding: 0.5rem;
+        border-radius: 5px;
+        border: none;
+    }
+    .stButton>button:hover {
+        background-color: #45a049;
+    }
+    .upload-section {
+        border: 2px dashed #cccccc;
+        border-radius: 5px;
+        padding: 2rem;
+        margin: 1rem 0;
+    }
+    .stat-box {
+        background-color: #f8f9fa;
+        border-radius: 5px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+    }
     </style>
 """, unsafe_allow_html=True)
 
-def get_default_columns(available_columns):
-    """
-    Returns a list of default columns that exist in the uploaded file.
-    """
-    desired_columns = ['MeasureDescription', 'CauseDescription', 'TechnicalObjectDescription']
-    return [col for col in desired_columns if col in available_columns]
+# Get OpenAI API key from Streamlit secrets
+if 'OPENAI_API_KEY' not in st.secrets:
+    st.error('OPENAI_API_KEY not found in secrets. Please add it to your .streamlit/secrets.toml file.')
+    st.stop()
+
+os.environ['OPENAI_API_KEY'] = st.secrets['OPENAI_API_KEY']
+
+def get_file_size(file):
+    """Get file size in appropriate units."""
+    size_bytes = len(file.getvalue())
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} GB"
+
+def process_file(uploaded_file, columns_to_translate):
+    """Process the uploaded Excel file and translate selected columns."""
+    df = pd.read_excel(uploaded_file)
+    
+    # Initialize session state for stats if not exists
+    if 'translation_stats' not in st.session_state:
+        st.session_state.translation_stats = {
+            'total_cells': 0,
+            'unique_texts': 0,
+            'processed_columns': 0
+        }
+    
+    # Create a progress bar
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # Calculate total translations needed
+    total_translations = sum(len(df[col].unique()) for col in columns_to_translate)
+    current_progress = 0
+    
+    # Update stats
+    st.session_state.translation_stats['total_cells'] = sum(len(df[col]) for col in columns_to_translate)
+    st.session_state.translation_stats['unique_texts'] = total_translations
+    st.session_state.translation_stats['processed_columns'] = len(columns_to_translate)
+    
+    # Process each selected column
+    for column in columns_to_translate:
+        status_text.text(f"Processing column: {column}")
+        
+        # Create translation cache for the column
+        translation_cache = create_translation_cache(df, column)
+        
+        # Create new column name
+        new_column = f"{column}_English"
+        
+        # Translate unique values
+        unique_translations = {}
+        for text in df[column].unique():
+            if pd.notna(text):  # Skip NaN values
+                translated = translate_text(text, translation_cache)
+                unique_translations[text] = translated
+                
+                # Update progress
+                current_progress += 1
+                progress_percentage = current_progress / total_translations
+                progress_bar.progress(progress_percentage)
+        
+        # Apply translations to DataFrame
+        df[new_column] = df[column].map(unique_translations)
+    
+    progress_bar.progress(1.0)
+    status_text.text("Translation completed!")
+    
+    return df
 
 def main():
-    # Get API key from secrets
-    if 'OPENAI_API_KEY' not in st.secrets:
-        st.error('OpenAI API key not found in secrets. Please add it to .streamlit/secrets.toml')
-        return
-    
-    # Initialize OpenAI client with secret key
-    client = OpenAI(api_key=st.secrets['OPENAI_API_KEY'])
-    
-    # Sidebar
-    with st.sidebar:
-        st.markdown("## Excel Translator")
-        st.markdown("---")
-        st.markdown("### About")
-        st.info("""
-        🔄 This application translates Excel files from German to English using OpenAI's advanced language models.
-        
-        ✨ Features:
-        - Multiple column translation
-        - Batch processing
-        - Progress tracking
-        - Preview capabilities
-        """)
-        st.markdown("---")
-        st.markdown("### Settings")
-        show_original = st.toggle("📊 Show original text", value=True)
-        batch_size = st.slider("📦 Batch Size", 5, 50, 10)
-
-    # Main content
-    st.title("🌐 Excel Translator Pro")
+    # Title and description
+    st.title("🌐 Excel Translator")
     st.markdown("""
-        <p style='text-align: center; color: #666; font-size: 1.2rem; margin-bottom: 2rem;'>
-        Transform your German Excel documents into English with advanced AI translation
-        </p>
-    """, unsafe_allow_html=True)
-
-    # File upload section
+    Transform your Excel files by translating columns from German to English using OpenAI's GPT API.
+    Upload your file, select columns, and get instant translations!
+    """)
+    
+    # Sidebar with settings and stats
+    with st.sidebar:
+        st.header("⚙️ Settings & Stats")
+        if 'translation_stats' in st.session_state:
+            st.markdown("### 📊 Translation Statistics")
+            st.metric("Processed Columns", st.session_state.translation_stats['processed_columns'])
+            st.metric("Total Cells", st.session_state.translation_stats['total_cells'])
+            st.metric("Unique Texts", st.session_state.translation_stats['unique_texts'])
+    
+    # Main content
     col1, col2 = st.columns([2, 1])
+    
     with col1:
+        st.markdown("### 📤 Upload File")
         uploaded_file = st.file_uploader(
-            "📂 Choose your Excel file",
+            "Choose an Excel file",
             type=['xlsx', 'xls'],
-            help="Upload an Excel file containing German text to translate"
+            help="Upload your Excel file containing German text"
         )
-
-    if uploaded_file:
-        try:
-            # Read Excel file
-            df = pd.read_excel(uploaded_file)
-            
-            # Display file statistics
-            with col2:
-                create_metrics_card("📊 Total Rows", f"{len(df):,}")
-                create_metrics_card("📑 Total Columns", len(df.columns))
-
-            # Get available columns and default selection
-            available_columns = df.columns.tolist()
-            default_columns = get_default_columns(available_columns)
-
-            # Column selection with dynamic defaults
-            st.markdown("### 🎯 Select Columns to Translate")
-            columns_to_translate = st.multiselect(
-                "Choose the columns containing German text:",
-                options=available_columns,
-                default=default_columns if default_columns else None,
-                help="Select the columns that contain German text you want to translate"
-            )
-
-            if columns_to_translate:
-                # Preview original data
-                if show_original:
-                    st.markdown("### 📊 Original Data Preview")
-                    st.dataframe(
-                        df[columns_to_translate].head(),
-                        use_container_width=True,
-                        height=200
-                    )
-
-                # Translation process
-                if st.button("🚀 Start Translation", use_container_width=True):
-                    try:
-                        progress_placeholder = st.empty()
-                        
-                        with st.spinner("🔄 Translation in progress..."):
-                            start_time = time.time()
-                            translated_df = process_excel(
-                                df=df,
-                                translate_col=columns_to_translate,
-                                client=client,
-                                batch_size=batch_size,
-                                progress_callback=lambda x: progress_placeholder.progress(x)
-                            )
-                            end_time = time.time()
-
-                        st.success(f"""
-                            ✨ Translation completed successfully!
-                            ⏱️ Time taken: {end_time - start_time:.2f} seconds
-                            📊 Columns translated: {len(columns_to_translate)}
-                        """)
-
-                        # Preview translated data
-                        st.markdown("### 🎉 Translation Preview")
-                        preview_columns = []
-                        for col in columns_to_translate:
-                            preview_columns.extend([col, f"{col}_EN"])
-                        st.dataframe(
-                            translated_df[preview_columns].head(),
-                            use_container_width=True,
-                            height=300
-                        )
-
-                        # Download section
-                        st.markdown("### 💾 Download Results")
-                        buffer = BytesIO()
-                        translated_df.to_excel(buffer, index=False)
-                        
-                        st.download_button(
-                            label="📥 Download Translated Excel",
-                            data=buffer.getvalue(),
-                            file_name="translated_document.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True
-                        )
-
-                    except Exception as e:
-                        st.error(f"❌ An error occurred during translation: {str(e)}")
         
-        except Exception as e:
-            st.error(f"❌ Error reading Excel file: {str(e)}")
-            st.info("Please make sure your Excel file is not corrupted and try again.")
+        if uploaded_file is not None:
+            file_size = get_file_size(uploaded_file)
+            st.info(f"File uploaded: {uploaded_file.name} ({file_size})")
+            
+            # Read and display original file
+            df = pd.read_excel(uploaded_file)
+            st.markdown("### 👀 File Preview")
+            st.dataframe(df.head(), use_container_width=True)
+            
+            # Column selection
+            st.markdown("### 🎯 Select Columns")
+            available_columns = df.columns.tolist()
+            columns_to_translate = st.multiselect(
+                "Select columns to translate",
+                available_columns,
+                help="You can select multiple columns for translation"
+            )
+            
+            if columns_to_translate:
+                if st.button("🚀 Start Translation", use_container_width=True):
+                    with st.spinner("Translation in progress..."):
+                        translated_df = process_file(uploaded_file, columns_to_translate)
+                        
+                        st.markdown("### ✨ Preview of Translated File")
+                        st.dataframe(translated_df.head(), use_container_width=True)
+                        
+                        # Save to temporary file for download
+                        temp_dir = tempfile.mkdtemp()
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        output_file = os.path.join(temp_dir, f"translated_{timestamp}.xlsx")
+                        translated_df.to_excel(output_file, index=False)
+                        
+                        # Create download button
+                        with open(output_file, 'rb') as f:
+                            st.download_button(
+                                label="📥 Download Translated File",
+                                data=f,
+                                file_name=f"translated_{timestamp}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True
+                            )
+    
+    with col2:
+        if uploaded_file is None:
+            st.markdown("### 🔍 How to Use")
+            st.markdown("""
+            1. Upload your Excel file using the file uploader
+            2. Review the file preview
+            3. Select columns to translate
+            4. Click 'Start Translation'
+            5. Download your translated file
+            """)
+            
+            st.markdown("### ℹ️ Note")
+            st.info("""
+            - Files are processed securely
+            - Translations are powered by OpenAI's GPT API
+            - Large files may take longer to process
+            """)
 
 if __name__ == "__main__":
     main()
