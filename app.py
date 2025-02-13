@@ -3,12 +3,12 @@ import pandas as pd
 import os
 import tempfile
 from datetime import datetime
-from excel_translation import translate_text, create_translation_cache
+from translation import translate_text, create_translation_cache
 from io import BytesIO
 
 # Page configuration
 st.set_page_config(
-    page_title="Excel Translator",
+    page_title="Translator",
     page_icon="🌐",
     layout="wide"
 )
@@ -76,8 +76,17 @@ def get_file_size(file):
     return f"{size_bytes:.2f} GB"
 
 def process_file(uploaded_file, columns_to_translate, batch_size):
-    """Process the uploaded Excel file and translate selected columns."""
-    df = pd.read_excel(uploaded_file)
+    """Process the uploaded file (Excel or Stata) and translate selected columns."""
+    # Determine file type
+    file_type = os.path.splitext(uploaded_file.name)[1].lower()
+    
+    # Read file based on type
+    if file_type in ['.xlsx', '.xls']:
+        df = pd.read_excel(uploaded_file)
+        stata_meta = None
+    else:  # .dta
+        df, stata_meta = pd.read_stata(uploaded_file)
+        st.session_state.stata_meta = stata_meta
     
     # Initialize session state for stats if not exists
     if 'translation_stats' not in st.session_state:
@@ -134,9 +143,9 @@ def process_file(uploaded_file, columns_to_translate, batch_size):
 
 def main():
     # Title and description
-    st.title("🌐 Excel Translator")
+    st.title("🌐 File Translator")
     st.markdown("""
-    Transform your Excel files by translating columns from German to English using OpenAI's GPT API.
+    Transform your Excel or Stata files by translating columns from German to English using OpenAI's GPT API.
     Upload your file, select columns, and get instant translations!
     """)
     
@@ -166,28 +175,35 @@ def main():
         st.markdown("### 📤 Upload File")
         uploaded_file = st.file_uploader(
             "Choose an Excel file",
-            type=['xlsx', 'xls'],
-            help="Upload your Excel file containing German text"
+            type=['xlsx', 'xls', 'dta'],
+            help="Upload your file containing German text"
         )
         
         if uploaded_file is not None:
             file_size = get_file_size(uploaded_file)
+            file_type = os.path.splitext(uploaded_file.name)[1].lower()
             st.info(f"File uploaded: {uploaded_file.name} ({file_size})")
             
-            # Read and display original file
-            df = pd.read_excel(uploaded_file)
-            st.markdown("### 👀 File Preview")
-            st.dataframe(
-                df.head(),
-                use_container_width=True,
-                column_config={
-                    col: st.column_config.TextColumn(
-                        col,
-                        width="auto",
-                        help=f"Column: {col}"
-                    ) for col in df.columns
-                }
-            )
+            # Read and display original file based on type
+            if file_type in ['.xlsx', '.xls']:
+                # Read and display original file
+                df = pd.read_excel(uploaded_file)
+                st.markdown("### 👀 File Preview")
+                st.dataframe(
+                    df.head(),
+                    use_container_width=True,
+                    column_config={
+                        col: st.column_config.TextColumn(
+                            col,
+                            width="auto",
+                            help=f"Column: {col}"
+                        ) for col in df.columns
+                    }
+                )
+            else:  # .dta
+                df, meta = pd.read_stata(uploaded_file)
+                # Store metadata in session state for later use
+                st.session_state.stata_meta = meta
             
             # Column selection
             st.markdown("### 🎯 Select Columns")
@@ -203,30 +219,31 @@ def main():
                     with st.spinner("Translation in progress..."):
                         translated_df = process_file(uploaded_file, columns_to_translate, batch_size)
                         
-                        st.markdown("### ✨ Preview of Translated File")
-                        st.dataframe(
-                            translated_df.head(),
-                            use_container_width=True,
-                            column_config={
-                                col: st.column_config.TextColumn(
-                                    col,
-                                    width="auto",
-                                    help=f"Column: {col}"
-                                ) for col in translated_df.columns
-                            }
-                        )
-                        
-                        # Save to temporary file for download
+                        # Save based on file type
                         output_buffer = BytesIO()
-                        with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
-                            translated_df.to_excel(writer, index=False)
+                        if file_type in ['.xlsx', '.xls']:
+                            with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
+                                translated_df.to_excel(writer, index=False)
+                        else:  # .dta
+                            # Get metadata from session state
+                            meta = st.session_state.get('stata_meta', None)
+                            variable_labels = meta.variable_labels if meta else {}
+                            value_labels = meta.value_labels if meta else {}
+                            
+                            # Add labels for new translated columns
+                            for col in columns_to_translate:
+                                variable_labels[f"{col}_English"] = f"English translation of {col}"
+                            
+                            translated_df.to_stata(output_buffer, variable_labels=variable_labels,
+                                                value_labels=value_labels, version=118)
                         
-                        # Create download button
+                        # Create download button with appropriate extension
+                        file_extension = '.xlsx' if file_type in ['.xlsx', '.xls'] else '.dta'
                         st.download_button(
                             label="📥 Download Translated File",
                             data=output_buffer.getvalue(),
-                            file_name=f"translated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            file_name=f"translated_{datetime.now().strftime('%Y%m%d_%H%M%S')}{file_extension}",
+                            mime="application/octet-stream",
                             use_container_width=True
                         )
     
@@ -234,14 +251,13 @@ def main():
         if uploaded_file is None:
             st.markdown("### 🔍 How to Use")
             st.markdown("""
-            1. Upload your Excel file using the file uploader
+            1. Upload your Excel or Stata file using the file uploader
             2. Review the file preview
             3. Select columns to translate
             4. Adjust batch size in settings if needed
             5. Click 'Start Translation'
             6. Download your translated file
             """)
-            
             st.markdown("### ℹ️ Note")
             st.info("""
             - Files are processed securely
