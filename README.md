@@ -1,14 +1,15 @@
-# Excel Translator
+# File Translator
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A Python script that translates Excel columns from German to English using OpenAI's GPT API. The script maintains the original Excel structure and adds a new column with translations.
+A Python script that translates columns from German to English using OpenAI's GPT API. The script supports both Excel and Stata files, maintaining the original file structure and adding new columns with translations.
 
 ## Features
 
-- Translates specified Excel column from German to English
-- Preserves original Excel file structure
+- Translates specified columns from German to English
+- Supports both Excel (.xlsx, .xls) and Stata (.dta) files
+- Preserves original file structure and metadata
 - Handles batch processing for large files
 - Caches repeated phrases for efficiency
 - Creates detailed logs of the translation process
@@ -44,14 +45,14 @@ OPENAI_API_KEY=your-api-key-here
 
 ### Basic Command
 ```bash
-python excel_translation.py --input your_file.xlsx --column Column_Name
+python translation.py --input your_file.[xlsx|dta] --column Column_Name
 ```
 
 ### All Options
 ```bash
-python excel_translation.py 
-    --input input_file.xlsx 
-    --output translated_file.xlsx 
+python translation.py 
+    --input input_file.[xlsx|dta] 
+    --output translated_file.[xlsx|dta] 
     --column Column_Name 
     --new_col "Translation" 
     --batch_size 10
@@ -59,7 +60,7 @@ python excel_translation.py
 
 ### Arguments
 
-- `--input`: Your Excel file path (required)
+- `--input`: Your file path (Excel or Stata) (required)
 - `--output`: Where to save the translated file (optional)
 - `--column`: Column to translate - name or letter (required)
 - `--new_col`: Name for the translation column (default: "Translation")
@@ -67,7 +68,7 @@ python excel_translation.py
 
 ## Examples
 
-### Product Descriptions
+### Excel: Product Descriptions
 
 **Input:**
 ```
@@ -85,28 +86,31 @@ python excel_translation.py
 | 2         | Wasserdichte Sportuhr mit Herzfrequenzmesser | Waterproof sports watch with heart rate monitor |
 ```
 
-### Customer Reviews
+### Stata: Survey Responses
 
-**Input:**
-```
-| ReviewID | Comments                               |
-|----------|----------------------------------------|
-| 1        | Sehr gutes Produkt, schnelle Lieferung |
-| 2        | Die Qualität könnte besser sein        |
-```
+The script maintains Stata-specific features:
+- Variable labels
+- Value labels
+- Data types
+- Metadata preservation
 
-**Output:**
-```
-| ReviewID | Comments                               | Translation                          |
-|----------|----------------------------------------|--------------------------------------|
-| 1        | Sehr gutes Produkt, schnelle Lieferung | Very good product, fast delivery    |
-| 2        | Die Qualität könnte besser sein        | The quality could be better         |
+For example:
+```stata
+* Input Stata file
+label variable comments "Kundenkommentare"
+label define status 1 "Sehr zufrieden" 2 "Zufrieden" 3 "Unzufrieden"
+
+* After translation
+label variable comments "Customer comments"
+label define status 1 "Very satisfied" 2 "Satisfied" 3 "Unsatisfied"
 ```
 
 ## Files Generated
 
-- **Translated Excel File**: Original file with new translation column
-- **Log File** (`excel_translation.log`): Contains:
+- **Translated File**: Original file with new translation columns
+  - Excel: New .xlsx file with additional columns
+  - Stata: New .dta file with preserved metadata and labels
+- **Log File** (`translation.log`): Contains:
   - Translation progress
   - Any errors encountered
   - Processing statistics
@@ -118,13 +122,17 @@ python excel_translation.py
    - Check if `OPENAI_API_KEY.env` exists and contains your key
    - Verify the key is valid and not expired
 
-2. **"Cannot access Excel file"**
-   - Make sure the Excel file is not open in another program
+2. **"Cannot access file"**
+   - Make sure the file is not open in another program
    - Verify file path is correct
 
 3. **"Column not found"**
    - Confirm the column name matches exactly
-   - If using letter notation, ensure the column exists
+   - If using letter notation (Excel), ensure the column exists
+
+4. **"Stata metadata error"**
+   - Check if the Stata file version is compatible (Stata 13+)
+   - Ensure the file is not corrupted
 
 ## License
 
