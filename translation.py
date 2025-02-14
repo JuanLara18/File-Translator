@@ -135,7 +135,7 @@ Respond ONLY with the direct translation, nothing else."""
                 {"role": "user", "content": f"Translate: {text}"}
             ],
             temperature=0.1,
-            max_tokens=150  # Reduced as error messages are typically short
+            max_tokens=1000  # Reduced as error messages are typically short
         )
 
         translated_text = response.choices[0].message.content.strip()
