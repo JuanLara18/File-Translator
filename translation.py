@@ -189,11 +189,27 @@ def process_files(input_file: str, output_file: str, translate_col: str,
             logging.info(f"Loaded Excel file: {input_file} with {len(df)} rows.")
         elif file_extension == '.dta':
             try:
-                df = pd.read_stata(input_file)
-                stata_meta = df.stata_metadata if hasattr(df, 'stata_metadata') else None
-                logging.info(f"Loaded Stata file: {input_file} with {len(df)} rows.")
+                # Read Stata file with metadata
+                df = pd.read_stata(input_file, convert_categoricals=False)
+                # Store all metadata
+                stata_meta = {
+                    'value_labels': df.value_labels() if hasattr(df, 'value_labels') else {},
+                    'variable_labels': df.variable_labels() if hasattr(df, 'variable_labels') else {},
+                    'formats': {col: df[col].dtype for col in df.columns},
+                    'value_label_dict': {}
+                }
+                
+                # Store value label mappings for each variable
+                for col in df.columns:
+                    if hasattr(df[col], 'cat') and hasattr(df[col].cat, 'categories'):
+                        stata_meta['value_label_dict'][col] = dict(zip(
+                            df[col].cat.categories,
+                            df[col].cat.categories
+                        ))
+                
+                logging.info(f"Loaded Stata file: {input_file} with {len(df)} rows and metadata.")
             except Exception as e:
-                logging.warning(f"Could not load Stata metadata: {e}")
+                logging.warning(f"Could not load complete Stata metadata: {e}")
                 df = pd.read_stata(input_file)
                 stata_meta = None
                 logging.info(f"Loaded Stata file without metadata: {input_file} with {len(df)} rows.")
@@ -237,22 +253,27 @@ def process_files(input_file: str, output_file: str, translate_col: str,
         else:  # .dta
             try:
                 if stata_meta:
-                    variable_labels = getattr(stata_meta, 'variable_labels', {})
-                    value_labels = getattr(stata_meta, 'value_labels', {})
-                    variable_labels[new_col_name] = f"English translation of {translate_col}"
+                    # Update variable labels to include the new translation column
+                    if 'variable_labels' in stata_meta:
+                        original_label = stata_meta['variable_labels'].get(translate_col, translate_col)
+                        stata_meta['variable_labels'][new_col_name] = f"English translation of: {original_label}"
+                    
+                    # Save with preserved metadata
                     df.to_stata(
                         output_file,
-                        variable_labels=variable_labels,
-                        value_labels=value_labels,
+                        write_index=False,  # Prevent index column from being written
+                        variable_labels=stata_meta['variable_labels'],
+                        value_labels=stata_meta['value_labels'],
                         version=118
                     )
                 else:
-                    df.to_stata(output_file, version=118)
+                    # If no metadata, save without index
+                    df.to_stata(output_file, write_index=False, version=118)
                 logging.info(f"Saved translated Stata file to: {output_file}")
             except Exception as e:
                 logging.error(f"Error saving Stata file: {e}")
                 # Fallback to saving without metadata
-                df.to_stata(output_file, version=118)
+                df.to_stata(output_file, write_index=False, version=118)
                 logging.info(f"Saved translated Stata file without metadata to: {output_file}")
 
         # Log translation statistics
