@@ -17,11 +17,16 @@ import sys
 import argparse
 import logging
 import datetime
-from typing import Union, Tuple
+from typing import List, Dict, Any, Union, Tuple
 from dotenv import load_dotenv
 import pandas as pd
 from tqdm import tqdm
 from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+import numpy as np
+from threading import Lock
+
 
 # -----------------------
 # Configuration and Setup
@@ -48,48 +53,108 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Global constants
 MODEL_NAME = 'gpt-3.5-turbo'
-SYSTEM_MESSAGE = "You are a helpful assistant that translates German text into English."
-TRANSLATION_PROMPT = "Translate the following text from German to English:\n\n"
-
-SUPPORTED_FORMATS = {'.xlsx': 'excel', '.dta': 'stata'}
 
 # -----------------------
 # Functions
 # -----------------------
 
+def batch_translate_texts(texts: List[str], translation_cache: Dict[str, str] = None) -> Dict[str, str]:
+    """
+    Translates a batch of texts in parallel using ThreadPoolExecutor.
+    
+    Args:
+        texts: List of unique texts to translate
+        translation_cache: Optional cache dictionary for storing translations
+    
+    Returns:
+        Dictionary with translations
+    """
+    if translation_cache is None:
+        translation_cache = {}
+    
+    cache_lock = Lock()
+    texts_to_translate = [text for text in texts if text not in translation_cache or not translation_cache[text]]
+    
+    if not texts_to_translate:
+        return translation_cache
+    
+    def translate_single(text: str) -> tuple[str, str]:
+        if not isinstance(text, str) or not text.strip():
+            return text, text
+        
+        translated = translate_text(text)
+        with cache_lock:
+            translation_cache[text] = translated
+        return text, translated
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        list(executor.map(translate_single, texts_to_translate))
+    
+    return translation_cache
+
 def extract_translation(response_text: str) -> tuple[str, bool]:
     """
-    Extracts translation from a formatted response.
-    Returns the translation and a boolean indicating if the format was correct.
+    Extracts and validates translation from a response.
+    Returns the translation and a boolean indicating if it's valid.
     
-    :param response_text: The response text from the API
+    :param response_text: The response text to validate
     :return: Tuple of (translation, is_valid_format)
     """
     try:
-        # Check if response follows the exact format we expect
-        if "TRANSLATION:" in response_text:
-            # Split by TRANSLATION: and take the part after it
-            parts = response_text.split("TRANSLATION:")
-            if len(parts) == 2:
-                translation = parts[1].strip()
-                # Verify no explanatory text or quotes were added
-                if not any(marker in translation for marker in 
-                    ["means", "translates", "translation", "in English", '"', "'", "[", "]", "(", ")"]):
-                    return translation, True
-        return response_text, False
+        # Si el texto está vacío o no es string, no es válido
+        if not isinstance(response_text, str) or not response_text.strip():
+            return response_text, False
+            
+        # Limpiar el texto de elementos comunes no deseados
+        cleaned_text = (response_text.strip()
+                       .replace('"', '')
+                       .replace("'", "")
+                       .replace(" translates to ", "")
+                       .replace(" means ", "")
+                       .replace(" in English", "")
+                       .replace("Translation: ", ""))
+        
+        # Validaciones específicas para asegurar que es una traducción válida
+        invalid_markers = [
+            "means",
+            "translates",
+            "translation",
+            "in English",
+            "[original text]",
+            "(German)",
+            "German:",
+            "English:",
+            "=>",
+            "->",
+        ]
+        
+        # Si contiene marcadores de explicación, no es una traducción limpia
+        if any(marker in cleaned_text.lower() for marker in invalid_markers):
+            return response_text, False
+            
+        # Verificar que no sea igual al texto original si es una palabra común
+        common_german_words = {"ja", "nein", "und", "oder", "der", "die", "das"}
+        if cleaned_text.lower() in common_german_words:
+            return response_text, False
+            
+        return cleaned_text, True
+        
     except Exception as e:
         logging.error(f"Error extracting translation: {e}")
         return response_text, False
 
 def create_translation_cache(df: pd.DataFrame, column: str) -> dict:
     """
-    Creates a cache of unique texts to translate to avoid redundant API calls.
+    Creates a translation cache dictionary from unique values in the specified column.
     
-    :param df: DataFrame containing the texts to translate
-    :param column: Name of the column containing texts to translate
-    :return: Dictionary mapping unique texts to their frequency
+    Args:
+        df: Input DataFrame
+        column: Column name containing texts to translate
+    
+    Returns:
+        Dictionary with unique texts as keys and None as initial values
     """
-    return df[column].value_counts().to_dict()
+    return {text: None for text in df[column].dropna().unique() if isinstance(text, str)}
 
 def translate_text(text: str, translation_cache: dict = None) -> str:
     """
@@ -103,25 +168,23 @@ def translate_text(text: str, translation_cache: dict = None) -> str:
     if not isinstance(text, str) or not text.strip():
         return text
 
-    system_message = """You are a technical translator specializing in machine error messages and technical descriptions. Follow these rules:
+    system_message = """You are a technical translator specializing in machine error messages and technical descriptions. Follow these rules strictly:
 
 1. Translate from German to English precisely and technically
 2. Use consistent technical terminology
-3. Maintain any error codes or numbers exactly as they appear
-4. Keep punctuation that could be part of error syntax
-5. Do not add explanations or alternatives
-6. Do not modify technical terms in brackets or parentheses
-7. Preserve any variable names or placeholders exactly as they appear
+3. IMPORTANT: Only use the word "Error" if the German text contains "Fehler" or "Störung". Do not add the word "Error" if it's not in the original text
+4. Keep all codes, numbers, and technical identifiers exactly as they appear (e.g., CC31 should stay CC31, not "Error CC31")
+5. Maintain exact punctuation from the original text
+6. Do not add any explanations or alternatives
+7. Do not modify technical terms in brackets or parentheses
+8. Preserve all variable names and placeholders exactly as they appear
+9. NEVER add words that are not in the original text!
 
-Example 1:
+Example:
 Input: "Fehler E123: Motorüberhitzung"
 Output: Error E123: Motor overheating
 
-Example 2:
-Input: "Wartung erforderlich: Öldruck niedrig [P045]"
-Output: Maintenance required: Oil pressure low [P045]
-
-Respond ONLY with the direct translation, nothing else."""
+Do not add any additional text, explanations, or the word 'Error' unless 'Fehler' or 'Störung' is present in the original text. Respond ONLY with the direct translation."""
 
     try:
         # Check cache first if provided
@@ -164,19 +227,8 @@ Respond ONLY with the direct translation, nothing else."""
 def process_files(input_file: str, output_file: str, translate_col: str, 
                 new_col_name: str = "Translation", batch_size: int = 10):
     """
-    Processes Excel or Stata files by translating the content of the specified column.
-    Uses caching for efficiency with repeated texts and preserves file-specific metadata.
-    
-    Args:
-        input_file (str): Path to the input file (Excel or Stata)
-        output_file (str): Path where the translated file will be saved
-        translate_col (str): Name or letter of the column to translate
-        new_col_name (str, optional): Name for the translated column. Defaults to "Translation"
-        batch_size (int, optional): Number of texts to process at once. Defaults to 10
-    
-    Raises:
-        ValueError: If the column identifier is invalid
-        Exception: For file reading/writing errors or translation issues
+    Optimized version of process_files that uses parallel processing,
+    better unique value handling, and robust translation validation.
     """
     try:
         # Determine file type from extension
@@ -191,7 +243,6 @@ def process_files(input_file: str, output_file: str, translate_col: str,
             try:
                 # Read Stata file with metadata
                 df = pd.read_stata(input_file, convert_categoricals=False)
-                # Store all metadata
                 stata_meta = {
                     'value_labels': df.value_labels() if hasattr(df, 'value_labels') else {},
                     'variable_labels': df.variable_labels() if hasattr(df, 'variable_labels') else {},
@@ -199,7 +250,6 @@ def process_files(input_file: str, output_file: str, translate_col: str,
                     'value_label_dict': {}
                 }
                 
-                # Store value label mappings for each variable
                 for col in df.columns:
                     if hasattr(df[col], 'cat') and hasattr(df[col].cat, 'categories'):
                         stata_meta['value_label_dict'][col] = dict(zip(
@@ -216,35 +266,51 @@ def process_files(input_file: str, output_file: str, translate_col: str,
         else:
             raise ValueError(f"Unsupported file type: {file_extension}")
 
-        # Validate column - handle both name and Excel letter notation
+        # Validate column
         if translate_col not in df.columns:
             try:
-                # Convert Excel column letter to index (A=0, B=1, etc.)
                 col_index = ord(translate_col.upper()) - ord('A')
                 if 0 <= col_index < len(df.columns):
                     translate_col = df.columns[col_index]
-                    logging.info(f"Column letter '{translate_col}' converted to name: {translate_col}")
                 else:
                     raise ValueError(f"Column letter '{translate_col}' is out of range")
             except Exception as e:
                 logging.error(f"Invalid column identifier '{translate_col}': {e}")
                 raise ValueError(f"Invalid column identifier '{translate_col}'.")
 
-        # Create translation cache and get unique texts
-        translation_cache = {}
-        unique_texts = df[translate_col].value_counts()
-        logging.info(f"Found {len(unique_texts)} unique texts to translate.")
+        # Create translation cache from unique values
+        translation_cache = create_translation_cache(df, translate_col)
+        logging.info(f"Created translation cache with {len(translation_cache)} unique texts.")
 
-        # Translate unique texts with progress bar
-        unique_translations = {}
-        for text, count in tqdm(unique_texts.items(), desc="Translating unique texts"):
-            if pd.notna(text):  # Skip NaN values
-                translated = translate_text(str(text), translation_cache)
-                unique_translations[text] = translated
-                logging.info(f"Translated text (appears {count} times): {text} → {translated}")
+        # Process texts in batches
+        unique_texts = list(translation_cache.keys())
+        processed_translations = {}
+        invalid_translations = []
 
-        # Apply translations to DataFrame using the cache
-        df[new_col_name] = df[translate_col].map(lambda x: unique_translations.get(x, x) if pd.notna(x) else x)
+        for i in range(0, len(unique_texts), batch_size):
+            batch = unique_texts[i:i + batch_size]
+            
+            # Get translations for the batch
+            batch_translations = batch_translate_texts(batch, processed_translations)
+            
+            # Validate each translation
+            for original, translated in batch_translations.items():
+                cleaned_translation, is_valid = extract_translation(translated)
+                if is_valid:
+                    processed_translations[original] = cleaned_translation
+                else:
+                    invalid_translations.append(original)
+                    # Retry invalid translations individually
+                    single_translation = translate_text(original)
+                    retry_translation, retry_valid = extract_translation(single_translation)
+                    if retry_valid:
+                        processed_translations[original] = retry_translation
+                    else:
+                        processed_translations[original] = original  # Keep original if translation fails
+                        logging.warning(f"Translation failed for text: {original}")
+
+        # Apply translations using the processed translations dictionary
+        df[new_col_name] = df[translate_col].map(processed_translations)
 
         # Save file based on type
         if file_extension in ['.xlsx', '.xls']:
@@ -253,44 +319,42 @@ def process_files(input_file: str, output_file: str, translate_col: str,
         else:  # .dta
             try:
                 if stata_meta:
-                    # Update variable labels to include the new translation column
                     if 'variable_labels' in stata_meta:
                         original_label = stata_meta['variable_labels'].get(translate_col, translate_col)
                         stata_meta['variable_labels'][new_col_name] = f"English translation of: {original_label}"
                     
-                    # Save with preserved metadata
                     df.to_stata(
                         output_file,
-                        write_index=False,  # Prevent index column from being written
+                        write_index=False,
                         variable_labels=stata_meta['variable_labels'],
                         value_labels=stata_meta['value_labels'],
                         version=118
                     )
                 else:
-                    # If no metadata, save without index
                     df.to_stata(output_file, write_index=False, version=118)
                 logging.info(f"Saved translated Stata file to: {output_file}")
             except Exception as e:
                 logging.error(f"Error saving Stata file: {e}")
-                # Fallback to saving without metadata
                 df.to_stata(output_file, write_index=False, version=118)
                 logging.info(f"Saved translated Stata file without metadata to: {output_file}")
 
         # Log translation statistics
         total_texts = len(df)
-        unique_text_count = len(unique_translations)
+        unique_text_count = len(unique_texts)
         saved_calls = total_texts - unique_text_count
+        invalid_count = len(invalid_translations)
         
         logging.info("Translation statistics:")
         logging.info(f"Total texts processed: {total_texts}")
         logging.info(f"Unique texts translated: {unique_text_count}")
         logging.info(f"API calls saved through caching: {saved_calls}")
+        logging.info(f"Invalid translations requiring retry: {invalid_count}")
         
-        return df, unique_translations  # Return for potential further processing
+        return df, processed_translations
 
     except Exception as e:
         logging.error(f"Error processing file: {e}")
-        raise  # Raise instead of sys.exit() to allow proper error handling by caller
+        raise
 
 def generate_output_filename(input_file: str) -> str:
     """
