@@ -26,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import numpy as np
 from threading import Lock
+import os
+import json
 
 
 # -----------------------
@@ -33,13 +35,13 @@ from threading import Lock
 # -----------------------
 
 # Set up logging
-script_dir = os.path.dirname(os.path.abspath(__file__))
-logging.basicConfig(
-    filename=os.path.join(script_dir, 'translation.log'),
-    filemode='a',
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+#script_dir = os.path.dirname(os.path.abspath(__file__))
+#logging.basicConfig(
+#    filename=os.path.join(script_dir, 'translation.log'),
+#    filemode='a',
+#    level=logging.DEBUG,
+#    format='%(asctime)s - %(levelname)s - %(message)s'
+#)
 
 # Load environment variables from .env file
 load_dotenv("OPENAI_API_KEY.env")
@@ -57,6 +59,16 @@ MODEL_NAME = 'gpt-3.5-turbo'
 # -----------------------
 # Functions
 # -----------------------
+
+def load_translation_cache(cache_file="translations_cache.json"):
+    if os.path.exists(cache_file):
+        with open(cache_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_translation_cache(cache, cache_file="translations_cache.json"):
+    with open(cache_file, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
 
 def batch_translate_texts(texts: List[str], translation_cache: Dict[str, str] = None) -> Dict[str, str]:
     """
@@ -87,7 +99,7 @@ def batch_translate_texts(texts: List[str], translation_cache: Dict[str, str] = 
             translation_cache[text] = translated
         return text, translated
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=10) as executor:
         list(executor.map(translate_single, texts_to_translate))
     
     return translation_cache
@@ -198,7 +210,7 @@ Do not add any additional text, explanations, or the word 'Error' unless 'Fehler
                 {"role": "user", "content": f"Translate: {text}"}
             ],
             temperature=0.1,
-            max_tokens=1000  # Reduced as error messages are typically short
+            max_tokens=1500  # Reduced as error messages are typically short
         )
 
         translated_text = response.choices[0].message.content.strip()
@@ -227,133 +239,250 @@ Do not add any additional text, explanations, or the word 'Error' unless 'Fehler
 def process_files(input_file: str, output_file: str, translate_col: str, 
                 new_col_name: str = "Translation", batch_size: int = 10):
     """
-    Optimized version of process_files that uses parallel processing,
-    better unique value handling, and robust translation validation.
+    Memory-optimized version of process_files for handling large files efficiently.
+    Only loads required columns and processes data in chunks.
+    
+    Args:
+        input_file (str): Path to the input file (.xlsx, .xls, or .dta)
+        output_file (str): Path where the translated file will be saved
+        translate_col (str): Column name or letter to translate
+        new_col_name (str): Name for the new translation column
+        batch_size (int): Number of texts to process in each batch
     """
+
     try:
-        # Determine file type from extension
+        CHUNK_SIZE = 100000  # Adjust based on available memory
         file_extension = os.path.splitext(input_file)[1].lower()
-        
-        # Read file based on type
-        if file_extension in ['.xlsx', '.xls']:
-            df = pd.read_excel(input_file)
-            stata_meta = None
-            logging.info(f"Loaded Excel file: {input_file} with {len(df)} rows.")
-        elif file_extension == '.dta':
-            try:
-                # Read Stata file with metadata
-                df = pd.read_stata(input_file, convert_categoricals=False)
+
+        # Initialize progress tracking
+        with tqdm(total=100, desc="Overall Progress", position=0) as main_pbar:
+            print("\nInitializing translation process...")
+            persistent_cache = load_translation_cache()
+            main_pbar.update(5)
+
+            # First pass: Get column information and metadata
+            print("\nAnalyzing file structure...")
+            if file_extension == '.dta':
+                # Read first chunk to get column information
+                first_chunk = pd.read_stata(input_file, chunksize=1).__next__()
+                column_names = first_chunk.columns.tolist()
+                column_dtypes = first_chunk.dtypes.to_dict()
+                
+                # Get metadata
+                stata_reader = pd.read_stata(input_file, iterator=True)
                 stata_meta = {
-                    'value_labels': df.value_labels() if hasattr(df, 'value_labels') else {},
-                    'variable_labels': df.variable_labels() if hasattr(df, 'variable_labels') else {},
-                    'formats': {col: df[col].dtype for col in df.columns},
-                    'value_label_dict': {}
+                    'variable_labels': stata_reader.variable_labels(),
+                    'value_labels': stata_reader.value_labels(),
+                    'formats': column_dtypes  # Use the dtypes from the first chunk
                 }
+                stata_reader.close()
                 
-                for col in df.columns:
-                    if hasattr(df[col], 'cat') and hasattr(df[col].cat, 'categories'):
-                        stata_meta['value_label_dict'][col] = dict(zip(
-                            df[col].cat.categories,
-                            df[col].cat.categories
-                        ))
+                # Count total rows without loading entire file
+                print("Counting total rows...")
+                total_rows = 0
+                for chunk in pd.read_stata(input_file, chunksize=CHUNK_SIZE):
+                    total_rows += len(chunk)
+                    del chunk  # Free memory
                 
-                logging.info(f"Loaded Stata file: {input_file} with {len(df)} rows and metadata.")
-            except Exception as e:
-                logging.warning(f"Could not load complete Stata metadata: {e}")
-                df = pd.read_stata(input_file)
+            else:  # Excel files
+                if file_extension in ['.xlsx', '.xls']:
+                    # Read only the header to get column names
+                    df_info = pd.read_excel(input_file, nrows=0)
+                    column_names = df_info.columns.tolist()
+                    # Get total rows without loading the file
+                    total_rows = sum(1 for _ in pd.read_excel(input_file, usecols=[0]))
                 stata_meta = None
-                logging.info(f"Loaded Stata file without metadata: {input_file} with {len(df)} rows.")
-        else:
-            raise ValueError(f"Unsupported file type: {file_extension}")
 
-        # Validate column
-        if translate_col not in df.columns:
-            try:
-                col_index = ord(translate_col.upper()) - ord('A')
-                if 0 <= col_index < len(df.columns):
-                    translate_col = df.columns[col_index]
-                else:
-                    raise ValueError(f"Column letter '{translate_col}' is out of range")
-            except Exception as e:
-                logging.error(f"Invalid column identifier '{translate_col}': {e}")
-                raise ValueError(f"Invalid column identifier '{translate_col}'.")
+            print(f"Found {total_rows:,} rows to process")
 
-        # Create translation cache from unique values
-        translation_cache = create_translation_cache(df, translate_col)
-        logging.info(f"Created translation cache with {len(translation_cache)} unique texts.")
-
-        # Process texts in batches
-        unique_texts = list(translation_cache.keys())
-        processed_translations = {}
-        invalid_translations = []
-
-        for i in range(0, len(unique_texts), batch_size):
-            batch = unique_texts[i:i + batch_size]
-            
-            # Get translations for the batch
-            batch_translations = batch_translate_texts(batch, processed_translations)
-            
-            # Validate each translation
-            for original, translated in batch_translations.items():
-                cleaned_translation, is_valid = extract_translation(translated)
-                if is_valid:
-                    processed_translations[original] = cleaned_translation
-                else:
-                    invalid_translations.append(original)
-                    # Retry invalid translations individually
-                    single_translation = translate_text(original)
-                    retry_translation, retry_valid = extract_translation(single_translation)
-                    if retry_valid:
-                        processed_translations[original] = retry_translation
+            # Validate column
+            if translate_col not in column_names:
+                try:
+                    col_index = ord(translate_col.upper()) - ord('A')
+                    if 0 <= col_index < len(column_names):
+                        translate_col = column_names[col_index]
                     else:
-                        processed_translations[original] = original  # Keep original if translation fails
-                        logging.warning(f"Translation failed for text: {original}")
+                        raise ValueError(f"Column letter '{translate_col}' is out of range")
+                except Exception as e:
+                    raise ValueError(f"Invalid column identifier '{translate_col}'")
+            main_pbar.update(10)
 
-        # Apply translations using the processed translations dictionary
-        df[new_col_name] = df[translate_col].map(processed_translations)
+            # Second pass: Process only the required column in chunks
+            print("\nCollecting unique texts for translation...")
+            unique_texts = set()
+            chunks_processed = 0
+            
+            # Function to read chunks efficiently based on file type
+            def chunk_reader():
+                if file_extension == '.dta':
+                    return pd.read_stata(input_file, chunksize=CHUNK_SIZE, columns=[translate_col])
+                else:  # Excel
+                    return pd.read_excel(input_file, usecols=[translate_col], chunksize=CHUNK_SIZE)
 
-        # Save file based on type
-        if file_extension in ['.xlsx', '.xls']:
-            df.to_excel(output_file, index=False)
-            logging.info(f"Saved translated Excel file to: {output_file}")
-        else:  # .dta
-            try:
-                if stata_meta:
-                    if 'variable_labels' in stata_meta:
-                        original_label = stata_meta['variable_labels'].get(translate_col, translate_col)
-                        stata_meta['variable_labels'][new_col_name] = f"English translation of: {original_label}"
+            # Collect unique texts with progress tracking
+            with tqdm(total=total_rows, desc="Reading texts", position=1) as read_pbar:
+                for chunk in chunk_reader():
+                    unique_texts.update(chunk[translate_col].dropna().unique())
+                    read_pbar.update(len(chunk))
+                    chunks_processed += 1
+
+            main_pbar.update(15)
+
+            # Create translation cache
+            print("\nPreparing translation cache...")
+            translation_cache = {text: persistent_cache.get(text, None) 
+                              for text in unique_texts if isinstance(text, str)}
+            
+            cache_hits = sum(1 for v in translation_cache.values() if v is not None)
+            print(f"Found {cache_hits} cached translations")
+            main_pbar.update(10)
+
+            # Process translations
+            processed_translations = {}
+            invalid_translations = []
+            unique_texts_list = list(translation_cache.keys())
+            
+            total_batches = (len(unique_texts_list) + batch_size - 1) // batch_size
+            print(f"\nProcessing {len(unique_texts_list)} unique texts in {total_batches} batches...")
+            
+            # Translation process (same as before)
+            with tqdm(total=len(unique_texts_list), desc="Translating", position=1) as trans_pbar:
+                for i in range(0, len(unique_texts_list), batch_size):
+                    batch = unique_texts_list[i:i + batch_size]
+                    batch_translations = batch_translate_texts(batch, processed_translations)
                     
-                    df.to_stata(
-                        output_file,
-                        write_index=False,
-                        variable_labels=stata_meta['variable_labels'],
-                        value_labels=stata_meta['value_labels'],
-                        version=118
-                    )
-                else:
-                    df.to_stata(output_file, write_index=False, version=118)
-                logging.info(f"Saved translated Stata file to: {output_file}")
-            except Exception as e:
-                logging.error(f"Error saving Stata file: {e}")
-                df.to_stata(output_file, write_index=False, version=118)
-                logging.info(f"Saved translated Stata file without metadata to: {output_file}")
+                    for original, translated in batch_translations.items():
+                        cleaned_translation, is_valid = extract_translation(translated)
+                        if is_valid:
+                            processed_translations[original] = cleaned_translation
+                        else:
+                            invalid_translations.append(original)
+                            single_translation = translate_text(original)
+                            retry_translation, retry_valid = extract_translation(single_translation)
+                            if retry_valid:
+                                processed_translations[original] = retry_translation
+                            else:
+                                processed_translations[original] = original
+                        trans_pbar.update(1)
+                    
+                    main_pbar.update(30 / total_batches)
 
-        # Log translation statistics
-        total_texts = len(df)
-        unique_text_count = len(unique_texts)
-        saved_calls = total_texts - unique_text_count
-        invalid_count = len(invalid_translations)
-        
-        logging.info("Translation statistics:")
-        logging.info(f"Total texts processed: {total_texts}")
-        logging.info(f"Unique texts translated: {unique_text_count}")
-        logging.info(f"API calls saved through caching: {saved_calls}")
-        logging.info(f"Invalid translations requiring retry: {invalid_count}")
-        
-        return df, processed_translations
+            # Save translation cache
+            print("\nSaving translation cache...")
+            save_translation_cache(translation_cache)
+            main_pbar.update(5)
+
+            # Third pass: Create output file with translations
+            print(f"\nCreating translated file...")
+            if file_extension == '.dta':
+                # Initialize output Stata file
+                first_chunk = True
+                mode = 'w'
+                
+                with tqdm(total=total_rows, desc="Saving translations", position=1) as save_pbar:
+                    for chunk in pd.read_stata(input_file, chunksize=CHUNK_SIZE, convert_categoricals=False):
+                        # Create a copy of the chunk to avoid fragmentation
+                        chunk_copy = chunk.copy()
+                        
+                        # Add translations to chunk and ensure proper string conversion
+                        translations = chunk_copy[translate_col].map(processed_translations)
+                        # Convert all None/NaN values to empty strings for Stata compatibility
+                        translations = translations.fillna('').astype(str)
+                        
+                        # Ensure the translation column has a valid Stata variable name
+                        valid_colname = new_col_name.replace(' ', '_').replace('-', '_')
+                        chunk_copy[valid_colname] = translations
+                        
+                        # Convert any remaining problematic columns to string
+                        for col in chunk_copy.select_dtypes(include=['object']).columns:
+                            chunk_copy[col] = chunk_copy[col].fillna('').astype(str)
+                        
+                        # Convert datetime columns to string format
+                        for col in chunk_copy.select_dtypes(include=['datetime64']).columns:
+                            chunk_copy[col] = chunk_copy[col].dt.strftime('%Y-%m-%d')
+                        
+                        if first_chunk:
+                            try:
+                                # Write first chunk with metadata
+                                if stata_meta:
+                                    # Filter value_labels to only include existing columns
+                                    filtered_value_labels = {
+                                        key: value for key, value in stata_meta['value_labels'].items()
+                                        if key in chunk_copy.columns
+                                    }
+                                    
+                                    # Update variable labels with new column
+                                    variable_labels = stata_meta['variable_labels'].copy()
+                                    variable_labels[valid_colname] = f"English translation of: {variable_labels.get(translate_col, translate_col)}"
+                                    
+                                    # Write with filtered metadata
+                                    chunk_copy.to_stata(
+                                        output_file,
+                                        write_index=False,
+                                        variable_labels=variable_labels,
+                                        value_labels=filtered_value_labels,
+                                        version=118
+                                    )
+                                else:
+                                    chunk_copy.to_stata(output_file, write_index=False, version=118)
+                                mode = 'a'
+                                first_chunk = False
+                            except Exception as e:
+                                print(f"\nError writing first chunk: {str(e)}")
+                                print("\nAttempting to write without metadata...")
+                                # Fallback: try writing without metadata
+                                chunk_copy.to_stata(output_file, write_index=False, version=118)
+                                mode = 'a'
+                                first_chunk = False
+                        else:
+                            # Append subsequent chunks without metadata
+                            chunk_copy.to_stata(output_file, mode=mode, write_index=False, version=118)
+                        
+                        save_pbar.update(len(chunk))
+                        # Explicitly delete copies to free memory
+                        del chunk_copy
+                        del chunk
+
+            else:  # Excel files
+                writer = pd.ExcelWriter(output_file, engine='openpyxl')
+                first_chunk = True
+                
+                with tqdm(total=total_rows, desc="Saving translations", position=1) as save_pbar:
+                    for chunk in pd.read_excel(input_file, chunksize=CHUNK_SIZE):
+                        # Add translations and ensure proper data types
+                        translations = chunk[translate_col].map(processed_translations)
+                        chunk[new_col_name] = translations.fillna('').astype(str)
+                        
+                        if first_chunk:
+                            chunk.to_excel(writer, index=False, sheet_name='Sheet1')
+                            first_chunk = False
+                        else:
+                            # Append mode for Excel
+                            current_sheet = len(writer.sheets) + 1
+                            chunk.to_excel(writer, sheet_name=f'Sheet{current_sheet}', index=False)
+                        save_pbar.update(len(chunk))
+                
+                writer.close()
+
+            main_pbar.update(20)
+
+            # Log statistics
+            print("\n" + "="*50)
+            print("Translation Statistics:")
+            print("="*50)
+            print(f"Total rows processed:    {total_rows:,}")
+            print(f"Unique texts translated: {len(unique_texts_list):,}")
+            print(f"Cache hits:             {cache_hits:,}")
+            print(f"Failed translations:     {len(invalid_translations):,}")
+            success_rate = ((len(unique_texts_list) - len(invalid_translations)) / len(unique_texts_list) * 100) if unique_texts_list else 0
+            print(f"Success rate:           {success_rate:.1f}%")
+            print("="*50)
+
+            return True, processed_translations
 
     except Exception as e:
         logging.error(f"Error processing file: {e}")
+        print(f"\nError: {str(e)}")
         raise
 
 def generate_output_filename(input_file: str) -> str:
